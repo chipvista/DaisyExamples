@@ -1,0 +1,46 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Cortex Debug",
+      "type": "cortex-debug",
+      "request": "launch",
+
+      "servertype": "openocd",
+      "serverpath": "C:/Program Files/DaisyToolchain/bin/openocd.exe",
+
+      // OpenOCD config scripts
+      "configFiles": [
+        "interface/stlink.cfg",
+        "target/stm32h7x.cfg"
+      ],
+      "searchDir": [
+        "C:/Program Files/DaisyToolchain/share/openocd/scripts"
+      ],
+
+      "openOCDLaunchCommands": [
+        "adapter speed 4000",
+        "init",
+        "reset init",
+        "halt"
+      ],
+
+      "gdbPath": "C:/Program Files/DaisyToolchain/bin/arm-none-eabi-gdb.exe",
+      "executable": "${workspaceFolder}/build/spiral1.elf",
+
+      "cwd": "${workspaceFolder}",
+      "runToEntryPoint": "main",
+      "svdFile": "${workspaceFolder}/.vscode/STM32H750x.svd",
+
+      "preLaunchTask": "Build (Debug)",
+
+      "device": "STM32H750",
+      "interface": "swd",
+      "showDevDebugOutput": "none",
+
+      "postRestartCommands": [
+        "monitor reset halt"
+      ]
+    }
+  ]
+}
