@@ -26,6 +26,11 @@ static constexpr uint32_t BUFFER_SIZE    = SAMPLE_RATE_HZ * MAX_SECONDS; // 1920
 
 // --- Mix & UI state ---
 static float g_level = 0.5f;        // 0=dry, 1=wet
+// thread-safe publish for filter knob value
+volatile float filtCut_shared = 0.5f;   // knob value (0..1) pushed to audio thread
+static float g_level_sm = 0.5f;
+const float LEVEL_SMOOTH_ALPHA = 0.08f;
+
 static bool  g_level_edit = false;  // ON: knob2 edits wet/dry (LED blue)
 static bool  editEffectsMode = false; // ON: knob1 edits filter cutoff (LED green)
 
@@ -135,6 +140,16 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                    size_t                    size)
 {
     uint32_t start_cycles = dwt_cycles();
+    // --- apply latest filter cutoff safely (once per block) ---
+    static float last_applied_filt = -1.0f;
+    float newf = filtCut_shared;   // knob value 0..1 from main loop
+    if(fabsf(newf - last_applied_filt) > 1e-7f)
+{
+    filterL.SetFreqFromKnob(newf, 40.0f, 4000.0f);
+    filterR.SetFreqFromKnob(newf, 40.0f, 4000.0f);
+    last_applied_filt = newf;
+}
+
 
     uint32_t w = writeHead;
 
@@ -258,49 +273,65 @@ int main(void)
         }
 
         // While Level-Edit is ON, Knob2 sets wet/dry LEVEL
+        // Smooth wet/dry in Level Edit to avoid zipper noise
         if(g_level_edit)
-        {
-            g_level = pod.knob2.Value(); // 0..1
-        }
+{
+        float g_target = pod.knob2.Value();
+        g_level_sm += (g_target - g_level_sm) * LEVEL_SMOOTH_ALPHA;
+        g_level = g_level_sm;
+}
 
         // === BTN1 LONG PRESS: toggle Effect Edit (mutually exclusive with Level Edit) ===
-        // --- BTN1 LONG / SHORT handling (mutually exclusive) ---
-        static bool btn1SuppressNextRise = false;
+        // Put this inside the main loop in place of the current Button1 code.
 
-        if(pod.button1.Pressed())
+// Button1 handling: detect rising edge (short press) and long press (hold)
+static bool btn1_was_pressed = false;
+static uint32_t btn1_press_start = 0;
+static bool btn1_long_handled = false;
+
+if(pod.button1.Pressed())
+{
+    if(!btn1_was_pressed)
     {
-        if(btn1PressStartMs == 0)
-        btn1PressStartMs = System::GetNow();
-
-            // fire long once
-        if(!btn1LongFired && (System::GetNow() - btn1PressStartMs >= BTN1_HOLD_MS))
-     {
-        editEffectsMode = !editEffectsMode;
-        if(editEffectsMode) g_level_edit = false; // modes exclusive
-        btn1LongFired = true;
-        btn1SuppressNextRise = true;              // block upcoming short
-        pod.seed.PrintLine("EffectEdit=%d LevelEdit=%d",
-                           editEffectsMode ? 1 : 0, g_level_edit ? 1 : 0);
+        // newly pressed
+        btn1_was_pressed = true;
+        btn1_press_start = System::GetNow();
+        btn1_long_handled = false;
+    }
+    else
+    {
+        // still pressed -> check long
+        if(!btn1_long_handled && (System::GetNow() - btn1_press_start >= BTN1_HOLD_MS))
+        {
+            // Long press action: toggle Effect Edit
+            editEffectsMode = !editEffectsMode;
+            if(editEffectsMode) g_level_edit = false;
+            btn1_long_handled = true;
+            pod.seed.PrintLine("EffectEdit=%d LevelEdit=%d",
+                editEffectsMode ? 1 : 0, g_level_edit ? 1 : 0);
         }
+    }
 }
 else
+{
+    // released
+    if(btn1_was_pressed)
     {
-    // button released -> handle potential short press
-    if(pod.button1.RisingEdge())
-    {
-        if(!btn1SuppressNextRise)
+        // it was previously pressed -> this is a release
+        if(!btn1_long_handled)
         {
+            // short press action (only if long wasn't handled)
             bufferLengthIndex = (bufferLengthIndex + 1) % 3;
             currentBufferLengthMs = bufferLengthMsTable[bufferLengthIndex];
             pod.seed.PrintLine("Buffer length set to %ums", currentBufferLengthMs);
         }
     }
+    // reset state
+    btn1_was_pressed = false;
+    btn1_press_start = 0;
+    btn1_long_handled = false;
+}
 
-    // reset all long/short tracking AFTER the rising-edge check
-        btn1PressStartMs = 0;
-        btn1LongFired = false;
-        btn1SuppressNextRise = false;
-    }
 
         // === BTN2: trigger single grain ===
         if(pod.button2.RisingEdge())
@@ -337,14 +368,15 @@ else
         // === Effect Edit mapping (filter) ===
         float target_filt = filtCut_sm;
         if(editEffectsMode)
-        {
-            // knob1 -> filter cutoff when in Effect Edit
-            target_filt = pod.knob1.Value();
-        }
-        // smooth and apply
+{
+     // knob1 drives filter cutoff in Effect Edit
+        target_filt = pod.knob1.Value();
+}
+
+        // smooth the knob and publish to audio thread
         filtCut_sm += (target_filt - filtCut_sm) * SMOOTH_ALPHA;
-        filterL.SetFreqFromKnob(filtCut_sm, 40.0f, 4000.0f);
-        filterR.SetFreqFromKnob(filtCut_sm, 40.0f, 4000.0f);
+        filtCut_shared = filtCut_sm;   // publish safely
+
 
 
         // === LED feedback (mutually exclusive colors) ===
