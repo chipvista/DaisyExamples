@@ -110,8 +110,10 @@ void triggerGrain(uint32_t startSample, uint32_t lengthSamples, float pitchRatio
     grain.startSample = startSample;
 }
 
+// ----------------- global band-pass filter -----------------
 // ----------------- DSP modules -----------------
-FilterBank filterBank;
+FilterBank filterL;
+FilterBank filterR;
 
 // ----------------- UI / buffer length -----------------
 uint8_t bufferLengthIndex = 2; // 0:900ms, 1:2000ms, 2:4000ms
@@ -176,11 +178,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         float mixR = (1.0f - g_level) * dryR + g_level * wetR;
 
     // --- Global band-pass filter (both channels processed) ---
-        filterBank.Process(mixL);
-        float filtL = filterBank.Band();
+        filterL.Process(mixL);
+        float filtL = filterL.Band();
 
-        filterBank.Process(mixR);
-        float filtR = filterBank.Band();
+        filterR.Process(mixR);
+        float filtR = filterR.Band();
+
 
     // Write to output
     out[0][i] = filtL;
@@ -211,7 +214,10 @@ int main(void)
     dwt_init();
 
     // DSP init
-    filterBank.Init((float)SAMPLE_RATE_HZ);
+    
+    filterL.Init((float)SAMPLE_RATE_HZ);
+    filterR.Init((float)SAMPLE_RATE_HZ);
+
 
     // audio setup
     pod.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
@@ -258,33 +264,43 @@ int main(void)
         }
 
         // === BTN1 LONG PRESS: toggle Effect Edit (mutually exclusive with Level Edit) ===
-        if(pod.button1.Pressed())
-        {
-            if(btn1PressStartMs == 0)
-                btn1PressStartMs = System::GetNow();
-            else if(!btn1LongFired && (System::GetNow() - btn1PressStartMs >= BTN1_HOLD_MS))
-            {
-                editEffectsMode = !editEffectsMode;
-                if(editEffectsMode)
-                    g_level_edit = false; // make modes exclusive
-                btn1LongFired = true; // suppress short-press action on release
-                pod.seed.PrintLine("EffectEdit=%d LevelEdit=%d", editEffectsMode ? 1 : 0, g_level_edit ? 1 : 0);
-            }
-        }
-        else
-        {
-            // button released
-            btn1PressStartMs = 0;
-            btn1LongFired = false;
-        }
+        // --- BTN1 LONG / SHORT handling (mutually exclusive) ---
+        static bool btn1SuppressNextRise = false;
 
-        // === BTN1 SHORT PRESS (RisingEdge) cycles buffer length — but only if not just long-pressed ===
-        if(pod.button1.RisingEdge() && !btn1LongFired)
+        if(pod.button1.Pressed())
+    {
+        if(btn1PressStartMs == 0)
+        btn1PressStartMs = System::GetNow();
+
+            // fire long once
+        if(!btn1LongFired && (System::GetNow() - btn1PressStartMs >= BTN1_HOLD_MS))
+     {
+        editEffectsMode = !editEffectsMode;
+        if(editEffectsMode) g_level_edit = false; // modes exclusive
+        btn1LongFired = true;
+        btn1SuppressNextRise = true;              // block upcoming short
+        pod.seed.PrintLine("EffectEdit=%d LevelEdit=%d",
+                           editEffectsMode ? 1 : 0, g_level_edit ? 1 : 0);
+        }
+}
+else
+    {
+    // button released -> handle potential short press
+    if(pod.button1.RisingEdge())
+    {
+        if(!btn1SuppressNextRise)
         {
             bufferLengthIndex = (bufferLengthIndex + 1) % 3;
             currentBufferLengthMs = bufferLengthMsTable[bufferLengthIndex];
             pod.seed.PrintLine("Buffer length set to %ums", currentBufferLengthMs);
         }
+    }
+
+    // reset all long/short tracking AFTER the rising-edge check
+        btn1PressStartMs = 0;
+        btn1LongFired = false;
+        btn1SuppressNextRise = false;
+    }
 
         // === BTN2: trigger single grain ===
         if(pod.button2.RisingEdge())
@@ -327,7 +343,9 @@ int main(void)
         }
         // smooth and apply
         filtCut_sm += (target_filt - filtCut_sm) * SMOOTH_ALPHA;
-        filterBank.SetFreqFromKnob(filtCut_sm, 40.0f, 4000.0f);
+        filterL.SetFreqFromKnob(filtCut_sm, 40.0f, 4000.0f);
+        filterR.SetFreqFromKnob(filtCut_sm, 40.0f, 4000.0f);
+
 
         // === LED feedback (mutually exclusive colors) ===
         if(g_level_edit)
@@ -339,29 +357,40 @@ int main(void)
         pod.UpdateLeds();
 
         // periodic profiler print (integer-safe)
-        uint32_t t = System::GetNow();
-        if(t - lastTick >= 1000)
-        {
-            lastTick = t;
-            uint32_t maxc  = audio_max_cycles;
-            uint32_t lastc = audio_last_cycles;
-            uint32_t block = pod.AudioBlockSize();
-            uint64_t cps_x100 = (uint64_t)maxc * 100ULL / (uint64_t)block;
-            const uint64_t CPU_FREQ = 480000000ULL;
-            uint64_t cpu_pct_x100 = ((uint64_t)maxc * (uint64_t)pod.AudioSampleRate() * 10000ULL)
-                                    / ((uint64_t)block * CPU_FREQ);
-            uint64_t cpu_int = cpu_pct_x100 / 100ULL;
-            uint64_t cpu_frac = cpu_pct_x100 % 100ULL;
+        // ---- profiler print (CPU usage) ----
+uint32_t t = System::GetNow();
+if(t - lastTick >= 1000)
+{
+    lastTick = t;
 
-            pod.seed.PrintLine("Audio cycles last=%u max=%u block=%u cps_x100=%llu cpu=%llu.%02llu%%",
-                lastc, maxc, block,
-                (unsigned long long)cps_x100,
-                (unsigned long long)cpu_int,
-                (unsigned long long)cpu_frac);
+    uint32_t maxc  = audio_max_cycles;
+    uint32_t lastc = audio_last_cycles;
+    uint32_t block = pod.AudioBlockSize();
 
-            audio_max_cycles = 0;
-            audio_min_cycles = UINT32_MAX;
-        }
+    // cycles-per-sample ×100
+    uint32_t cps_x100 = (maxc * 100U) / block;
+
+    // CPU percent ×100
+    const uint64_t CPU_FREQ = 480000000ULL; // Hz
+    uint64_t cpu_pct_x100 =
+        ((uint64_t)maxc * (uint64_t)pod.AudioSampleRate() * 10000ULL) /
+        ((uint64_t)block * CPU_FREQ);
+
+    uint32_t cpu_int  = (uint32_t)(cpu_pct_x100 / 100ULL);
+    uint32_t cpu_frac = (uint32_t)(cpu_pct_x100 % 100ULL);
+
+    pod.seed.PrintLine(
+        "Audio cycles last=%lu max=%lu block=%lu cps_x100=%lu cpu=%lu.%02lu%%",
+        (unsigned long)lastc,
+        (unsigned long)maxc,
+        (unsigned long)block,
+        (unsigned long)cps_x100,
+        (unsigned long)cpu_int,
+        (unsigned long)cpu_frac);
+
+    audio_max_cycles = 0;
+    audio_min_cycles = UINT32_MAX;
+}
 
         System::Delay(1);
     }
