@@ -31,16 +31,15 @@ Buffer management modes:
 Filter bank: 1× band-pass (Svf) with log frequency mapping 40–4000 Hz (knob in Edit mode). ✅
 
 Hardware I/O mapping: 
-- Knob1: RATE/Filter cutoff ✅
-- Knob2: SCATTER/Level ✅  
-- Encoder: PITCH range ✅
-- Button1: Cycle buffer modes ✅
-- Button2: Trigger grain/Cycle envelope shapes ✅
-- Edit mode to swap knob function ✅
+Test                | Expected  
+----------------------------------------- |
+|Power on           | LED solid red                             | 
+|Encoder click      | LED blue, knob2 sweeps wet/dry            |
+|Button1 hold(≥0.8s)| LED green, knob1 sweeps filter 40–4000 Hz |
+|Button1 short      | Toggles buffer length & prints            |
+|Button2 press      | Grain triggered, Hann envelope            |
+|Knob1(Effect Edit) | Audible sweep from bass-heavy → treble    |
+|Mixed audio        | Always shaped by band-pass filter         |
 
 CLI/debug: integer-safe prints (no float printf), profiling with DWT cycles ✅
-
-Parameter smoothing to avoid clicks and sudden oscillation. ✅
-
-Master volume removed (no global software scaling). ✅
 
