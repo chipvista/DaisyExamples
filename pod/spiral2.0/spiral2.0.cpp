@@ -171,12 +171,21 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             }
         }
 
-        // final mix
-        float outL = (1.0f - g_level) * dryL + g_level * wetL;
-        float outR = (1.0f - g_level) * dryR + g_level * wetR;
+        // Mix dry/wet
+        float mixL = (1.0f - g_level) * dryL + g_level * wetL;
+        float mixR = (1.0f - g_level) * dryR + g_level * wetR;
 
-        out[0][i] = outL;
-        out[1][i] = outR;
+    // --- Global band-pass filter (both channels processed) ---
+        filterBank.Process(mixL);
+        float filtL = filterBank.Band();
+
+        filterBank.Process(mixR);
+        float filtR = filterBank.Band();
+
+    // Write to output
+    out[0][i] = filtL;
+    out[1][i] = filtR;
+
     }
 
     writeHead = w;
