@@ -58,6 +58,7 @@ struct Grain {
     float   gain = 1.0f;
     float   pan = 0.5f;
     uint32_t startSample = 0;
+    float   fixedStartPos = 0.f;  // Store fixed start position
 } grain;
 
 // ----------------- single-grain helpers -----------------
@@ -98,7 +99,8 @@ void triggerGrain(uint32_t startSample, uint32_t lengthSamples, float pitchRatio
     if(lengthSamples < 2) return;
     grain.active = true;
     grain.length = lengthSamples;
-    grain.pos = (float)startSample;
+    grain.fixedStartPos = (float)startSample;  // ADD: Store fixed position
+    grain.pos = grain.fixedStartPos;           // ADD: Initialize from fixed position
     grain.step = pitchRatio;
     grain.phase = 0;
     grain.gain = gain;
@@ -171,13 +173,21 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             wetL += sL * env * grain.gain * gL;
             wetR += sR * env * grain.gain * gR;
 
-            grain.pos += grain.step;
+            // FIXED: Calculate position from fixed start, not continuously forward
+            grain.pos = grain.fixedStartPos + (float)grain.phase * grain.step;
+            
+            // Handle buffer wraparound
+            if(grain.pos >= (float)BUFFER_SIZE) {
+                grain.pos -= (float)BUFFER_SIZE;
+            }
+            
             grain.phase++;
             if(grain.phase >= grain.length)
             {
                 grain.active = false;
             }
         }
+
 
         // Mix dry/wet
         float mixL = (1.0f - g_level) * dryL + g_level * wetL;
@@ -314,7 +324,8 @@ else
             // short press action (only if long wasn't handled)
             bufferLengthIndex = (bufferLengthIndex + 1) % 3;
             currentBufferLengthMs = bufferLengthMsTable[bufferLengthIndex];
-            pod.seed.PrintLine(">> Buffer window = %u ms", currentBufferLengthMs);
+           // pod.seed.PrintLine(">> Buffer window = %u ms", currentBufferLengthMs);
+            pod.seed.PrintLine("*** BUFFER LENGTH: %u ms ***", currentBufferLengthMs);
 
         }
     }
@@ -328,9 +339,7 @@ else
         // === BTN2: trigger single grain ===
         if(pod.button2.RisingEdge())
         {
-            // reset pitch accumulator so every grain starts neutral
-            enc_acc = 0;
-
+            
             // size: knob1 -> 40ms..1000ms
             float vsize = pod.knob1.Value(); // 0..1
             float ms = 40.0f + vsize * (1000.0f - 40.0f);
@@ -347,17 +356,24 @@ else
             while(start < 0) start += BUFFER_SIZE;
             uint32_t startIdx = (uint32_t)start % BUFFER_SIZE;
 
-            // pitch: encoder detents adjust semitones ONLY when not in effect edit
-            if(!editEffectsMode)
-            {
-                int32_t inc = pod.encoder.Increment();
-                if(inc != 0) enc_acc += inc;
-            }
+
             float pitchRatio = powf(2.0f, (float)enc_acc / 12.0f);
 
             triggerGrain(startIdx, lengthSamples, pitchRatio, 1.0f, 0.5f);
 
             pod.seed.PrintLine("Grain: start=%u len=%u semis=%d", startIdx, lengthSamples, enc_acc);
+        }
+        // === ENCODER HANDLING: adjust pitch semitones ===
+        if(!editEffectsMode)
+        {
+            int32_t inc = pod.encoder.Increment();
+            if(inc != 0) {
+                enc_acc += inc;
+                // Clamp to reasonable range
+                if(enc_acc > 24) enc_acc = 24;
+                if(enc_acc < -24) enc_acc = -24;
+                pod.seed.PrintLine("Pitch: %d semitones", enc_acc);
+            }
         }
 
         // === Effect Edit mapping (filter) ===
