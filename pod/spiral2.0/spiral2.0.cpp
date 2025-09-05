@@ -1,12 +1,3 @@
-// spiral1.cpp
-// Integrated Spiral-1 firmware for Daisy Pod (updated - delay removed, mode handling fixed)
-// - 4s SDRAM circular buffer (recording pass-through)
-// - Single-grain engine (manual trigger)
-// - Hann window envelope
-// - Filter bank (1x band-pass) driven by knob in Effect Edit mode
-// - Level Edit mode for Wet/Dry
-// - Parameter smoothing to avoid clicks/oscillation
-// - CLI debug and periodic profiler prints use integer math (no %f floats)
 
 #include "daisy_pod.h"
 #include "daisysp.h"
@@ -323,7 +314,8 @@ else
             // short press action (only if long wasn't handled)
             bufferLengthIndex = (bufferLengthIndex + 1) % 3;
             currentBufferLengthMs = bufferLengthMsTable[bufferLengthIndex];
-            pod.seed.PrintLine("Buffer length set to %ums", currentBufferLengthMs);
+            pod.seed.PrintLine(">> Buffer window = %u ms", currentBufferLengthMs);
+
         }
     }
     // reset state
@@ -336,6 +328,9 @@ else
         // === BTN2: trigger single grain ===
         if(pod.button2.RisingEdge())
         {
+            // reset pitch accumulator so every grain starts neutral
+            enc_acc = 0;
+
             // size: knob1 -> 40ms..1000ms
             float vsize = pod.knob1.Value(); // 0..1
             float ms = 40.0f + vsize * (1000.0f - 40.0f);

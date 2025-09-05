@@ -13,7 +13,7 @@ class FilterBank
     void Init(float sampleRate)
     {
         filt_.Init(sampleRate);
-        filt_.SetRes(0.8f); // moderate resonance (changeable)
+        filt_.SetRes(0.15f); //moderate resonance(changeable) essentially flat (no resonant peak)
         freq_ = 1000.0f;
     }
 
