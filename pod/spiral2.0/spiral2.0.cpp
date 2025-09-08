@@ -1,3 +1,6 @@
+// spiral1.cpp
+// Spiral-1 -> Spiral-2: added Double Buffering (ping-pong snapshot).
+// Other behavior preserved (single-grain, Hann, global band-pass filter, mode UI).
 
 #include "daisy_pod.h"
 #include "daisysp.h"
@@ -28,15 +31,26 @@ static bool  editEffectsMode = false; // ON: knob1 edits filter cutoff (LED gree
 // ----------------- hardware -----------------
 DaisyPod pod;
 
-// SDRAM buffers (stereo)
-float DSY_SDRAM_BSS bufferL[BUFFER_SIZE];
-float DSY_SDRAM_BSS bufferR[BUFFER_SIZE];
+// ----------------- DOUBLE BUFFERS (stereo) -----------------
+// Ping-pong buffers in SDRAM (two separate full-size buffers)
+float DSY_SDRAM_BSS bufferA_L[BUFFER_SIZE];
+float DSY_SDRAM_BSS bufferA_R[BUFFER_SIZE];
+float DSY_SDRAM_BSS bufferB_L[BUFFER_SIZE];
+float DSY_SDRAM_BSS bufferB_R[BUFFER_SIZE];
 
-// ring heads
+// which buffer is currently being written into (true = A, false = B)
+volatile bool useBufferA = true;
+
+// ring head inside the active buffer
 volatile uint32_t writeHead = 0;
-volatile uint32_t readHead  = 0;
 
-// profiling via DWT
+// flag indicating we have at least one completed (inactive) buffer ready for reading
+volatile bool inactiveBufferReady = false;
+
+// index of the last-sample (tail) in the inactive snapshot (always BUFFER_SIZE-1 after fill)
+uint32_t inactiveTailIndex = 0;
+
+// ----------------- profiling via DWT -----------------
 #include "core_cm7.h"
 volatile uint32_t audio_max_cycles = 0;
 volatile uint32_t audio_min_cycles = UINT32_MAX;
@@ -99,8 +113,9 @@ void triggerGrain(uint32_t startSample, uint32_t lengthSamples, float pitchRatio
     if(lengthSamples < 2) return;
     grain.active = true;
     grain.length = lengthSamples;
-    grain.fixedStartPos = (float)startSample;  // ADD: Store fixed position
-    grain.pos = grain.fixedStartPos;           // ADD: Initialize from fixed position
+    // store start relative to the inactive snapshot buffer indexing
+    grain.fixedStartPos = (float)startSample;
+    grain.pos = grain.fixedStartPos;
     grain.step = pitchRatio;
     grain.phase = 0;
     grain.gain = gain;
@@ -108,8 +123,7 @@ void triggerGrain(uint32_t startSample, uint32_t lengthSamples, float pitchRatio
     grain.startSample = startSample;
 }
 
-// ----------------- global band-pass filter -----------------
-// ----------------- DSP modules -----------------
+// ----------------- global band-pass filter (stereo) -----------------
 FilterBank filterL;
 FilterBank filterR;
 
@@ -118,10 +132,10 @@ uint8_t bufferLengthIndex = 2; // 0:900ms, 1:2000ms, 2:4000ms
 const uint32_t bufferLengthMsTable[3] = {900, 2000, 4000};
 uint32_t currentBufferLengthMs = 4000;
 
-// Button1 long-press state (for Effect Edit toggle)
+// Button long-press state
 uint32_t btn1PressStartMs = 0;
 bool     btn1LongFired    = false;
-const uint32_t BTN1_HOLD_MS = 800; // 0.8s hold => effect-edit toggle
+const uint32_t BTN1_HOLD_MS = 800; // ms
 
 // ----------------- parameter smoothing -----------------
 static float filtCut_sm    = 0.5f; // normalized knob value for filter
@@ -133,25 +147,48 @@ void AudioCallback(AudioHandle::InputBuffer  in,
                    size_t                    size)
 {
     uint32_t start_cycles = dwt_cycles();
-    // --- apply latest filter cutoff safely (once per block) ---
-    static float last_applied_filt = -1.0f;
-    float newf = filtCut_shared;   // knob value 0..1 from main loop
-    if(fabsf(newf - last_applied_filt) > 1e-7f)
-{
-    filterL.SetFreqFromKnob(newf, 40.0f, 4000.0f);
-    filterR.SetFreqFromKnob(newf, 40.0f, 4000.0f);
-    last_applied_filt = newf;
-}
 
+    // Apply latest filter cutoff once per block (safe publish)
+    static float last_applied_filt = -1.0f;
+    float newf = filtCut_shared;
+    if(fabsf(newf - last_applied_filt) > 1e-7f)
+    {
+        filterL.SetFreqFromKnob(newf, 40.0f, 4000.0f);
+        filterR.SetFreqFromKnob(newf, 40.0f, 4000.0f);
+        last_applied_filt = newf;
+    }
+
+    // Select active/inactive buffer pointers
+    float* writeBufL  = useBufferA ? bufferA_L : bufferB_L;
+    float* writeBufR  = useBufferA ? bufferA_R : bufferB_R;
+    float* readBufL   = useBufferA ? bufferB_L : bufferA_L; // read from the other (inactive) buffer
+    float* readBufR   = useBufferA ? bufferB_R : bufferA_R;
 
     uint32_t w = writeHead;
 
     for(size_t i = 0; i < size; i++)
     {
-        // record into ring
-        bufferL[w] = in[0][i];
-        bufferR[w] = in[1][i];
-        if(++w >= BUFFER_SIZE) w = 0;
+        // --- write input into active buffer ---
+        writeBufL[w] = in[0][i];
+        writeBufR[w] = in[1][i];
+
+        // Advance write head
+        if(++w >= BUFFER_SIZE)
+        {
+            // buffer full -> snapshot completed, swap buffers
+            w = 0;
+            useBufferA = !useBufferA; // swap active buffer
+
+            // after swap, inactiveBufferReady = true (we now have a completed buffer to read)
+            inactiveBufferReady = true;
+            inactiveTailIndex = BUFFER_SIZE - 1;
+
+            // update buffer pointers for subsequent samples (within same callback)
+            writeBufL  = useBufferA ? bufferA_L : bufferB_L;
+            writeBufR  = useBufferA ? bufferA_R : bufferB_R;
+            readBufL   = useBufferA ? bufferB_L : bufferA_L;
+            readBufR   = useBufferA ? bufferB_R : bufferA_R;
+        }
 
         float dryL = in[0][i];
         float dryR = in[1][i];
@@ -159,28 +196,25 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         float wetL = 0.0f;
         float wetR = 0.0f;
 
-        if(grain.active)
+        // --- grain from inactive snapshot buffer (only valid if we've captured at least one snapshot) ---
+        if(grain.active && inactiveBufferReady)
         {
             float sL, sR;
-            readStereoLinear(bufferL, bufferR, BUFFER_SIZE, grain.pos, sL, sR);
+            readStereoLinear(readBufL, readBufR, BUFFER_SIZE, grain.pos, sL, sR);
 
             float env = hann_val(grain.phase, grain.length);
 
-            // equal-power pan
             float gL = sqrtf(1.0f - grain.pan);
             float gR = sqrtf(grain.pan);
 
             wetL += sL * env * grain.gain * gL;
             wetR += sR * env * grain.gain * gR;
 
-            // FIXED: Calculate position from fixed start, not continuously forward
+            // advance pos using fixedStartPos base (so grain reads are consistent)
             grain.pos = grain.fixedStartPos + (float)grain.phase * grain.step;
-            
-            // Handle buffer wraparound
-            if(grain.pos >= (float)BUFFER_SIZE) {
-                grain.pos -= (float)BUFFER_SIZE;
-            }
-            
+            if(grain.pos >= (float)BUFFER_SIZE)
+                grain.pos -= (float)BUFFER_SIZE; // wrap
+
             grain.phase++;
             if(grain.phase >= grain.length)
             {
@@ -188,25 +222,23 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             }
         }
 
-
         // Mix dry/wet
         float mixL = (1.0f - g_level) * dryL + g_level * wetL;
         float mixR = (1.0f - g_level) * dryR + g_level * wetR;
 
-    // --- Global band-pass filter (both channels processed) ---
+        // Global band-pass filter (stereo)
         filterL.Process(mixL);
         float filtL = filterL.Band();
 
         filterR.Process(mixR);
         float filtR = filterR.Band();
 
-
-    // Write to output
-    out[0][i] = filtL;
-    out[1][i] = filtR;
-
+        // Output
+        out[0][i] = filtL;
+        out[1][i] = filtR;
     }
 
+    // store back write head
     writeHead = w;
 
     uint32_t end_cycles = dwt_cycles();
@@ -221,7 +253,7 @@ int main(void)
 {
     pod.Init();
     pod.seed.StartLog(false);
-    pod.seed.PrintLine("Spiral1: Granular (single-grain) + Filter (delay removed)");
+    pod.seed.PrintLine("Spiral1: Granular (single-grain) + Filter (delay removed) + Double Buffer (ping-pong)");
 
     // SDRAM init
     pod.seed.sdram_handle.Init();
@@ -230,20 +262,19 @@ int main(void)
     dwt_init();
 
     // DSP init
-    
     filterL.Init((float)SAMPLE_RATE_HZ);
     filterR.Init((float)SAMPLE_RATE_HZ);
-
 
     // audio setup
     pod.SetAudioSampleRate(SaiHandle::Config::SampleRate::SAI_48KHZ);
     pod.SetAudioBlockSize(48);
     pod.StartAdc();
 
-    // clear buffers
-    for(uint32_t i=0;i<BUFFER_SIZE;i++){ bufferL[i]=0.0f; bufferR[i]=0.0f; }
+    // clear both buffers
+    for(uint32_t i=0;i<BUFFER_SIZE;i++){ bufferA_L[i]=0.0f; bufferA_R[i]=0.0f; bufferB_L[i]=0.0f; bufferB_R[i]=0.0f; }
     writeHead = 0;
-    readHead  = 0;
+    useBufferA = true;
+    inactiveBufferReady = false;
 
     // LED default
     pod.led1.Set(1.0f,0.0f,0.0f); // red = normal
@@ -273,89 +304,86 @@ int main(void)
             pod.seed.PrintLine("LevelEdit=%d EffectEdit=%d", g_level_edit ? 1 : 0, editEffectsMode ? 1 : 0);
         }
 
-        // While Level-Edit is ON, Knob2 sets wet/dry LEVEL
-        // Smooth wet/dry in Level Edit to avoid zipper noise
+        // While Level-Edit is ON, Knob2 sets wet/dry LEVEL (smoothed)
         if(g_level_edit)
-{
-        float g_target = pod.knob2.Value();
-        g_level_sm += (g_target - g_level_sm) * LEVEL_SMOOTH_ALPHA;
-        g_level = g_level_sm;
-}
-
-        // === BTN1 LONG PRESS: toggle Effect Edit (mutually exclusive with Level Edit) ===
-        // Put this inside the main loop in place of the current Button1 code.
-
-// Button1 handling: detect rising edge (short press) and long press (hold)
-static bool btn1_was_pressed = false;
-static uint32_t btn1_press_start = 0;
-static bool btn1_long_handled = false;
-
-if(pod.button1.Pressed())
-{
-    if(!btn1_was_pressed)
-    {
-        // newly pressed
-        btn1_was_pressed = true;
-        btn1_press_start = System::GetNow();
-        btn1_long_handled = false;
-    }
-    else
-    {
-        // still pressed -> check long
-        if(!btn1_long_handled && (System::GetNow() - btn1_press_start >= BTN1_HOLD_MS))
         {
-            // Long press action: toggle Effect Edit
-            editEffectsMode = !editEffectsMode;
-            if(editEffectsMode) g_level_edit = false;
-            btn1_long_handled = true;
-            pod.seed.PrintLine("EffectEdit=%d LevelEdit=%d",
-                editEffectsMode ? 1 : 0, g_level_edit ? 1 : 0);
+            float g_target = pod.knob2.Value();
+            g_level_sm += (g_target - g_level_sm) * LEVEL_SMOOTH_ALPHA;
+            g_level = g_level_sm;
         }
-    }
-}
-else
-{
-    // released
-    if(btn1_was_pressed)
-    {
-        // it was previously pressed -> this is a release
-        if(!btn1_long_handled)
+
+        // === Button1 long/short press handling ===
+        static bool btn1_was_pressed = false;
+        static uint32_t btn1_press_start = 0;
+        static bool btn1_long_handled = false;
+
+        if(pod.button1.Pressed())
         {
-            // short press action (only if long wasn't handled)
-            bufferLengthIndex = (bufferLengthIndex + 1) % 3;
-            currentBufferLengthMs = bufferLengthMsTable[bufferLengthIndex];
-           // pod.seed.PrintLine(">> Buffer window = %u ms", currentBufferLengthMs);
-            pod.seed.PrintLine("*** BUFFER LENGTH: %u ms ***", currentBufferLengthMs);
-
+            if(!btn1_was_pressed)
+            {
+                btn1_was_pressed = true;
+                btn1_press_start = System::GetNow();
+                btn1_long_handled = false;
+            }
+            else
+            {
+                if(!btn1_long_handled && (System::GetNow() - btn1_press_start >= BTN1_HOLD_MS))
+                {
+                    editEffectsMode = !editEffectsMode;
+                    if(editEffectsMode) g_level_edit = false;
+                    btn1_long_handled = true;
+                    pod.seed.PrintLine("EffectEdit=%d LevelEdit=%d", editEffectsMode ? 1 : 0, g_level_edit ? 1 : 0);
+                }
+            }
         }
-    }
-    // reset state
-    btn1_was_pressed = false;
-    btn1_press_start = 0;
-    btn1_long_handled = false;
-}
-
+        else
+        {
+            if(btn1_was_pressed)
+            {
+                if(!btn1_long_handled)
+                {
+                    bufferLengthIndex = (bufferLengthIndex + 1) % 3;
+                    currentBufferLengthMs = bufferLengthMsTable[bufferLengthIndex];
+                    pod.seed.PrintLine("*** BUFFER LENGTH: %u ms ***", currentBufferLengthMs);
+                }
+            }
+            btn1_was_pressed = false;
+            btn1_press_start = 0;
+            btn1_long_handled = false;
+        }
 
         // === BTN2: trigger single grain ===
         if(pod.button2.RisingEdge())
         {
-            
             // size: knob1 -> 40ms..1000ms
             float vsize = pod.knob1.Value(); // 0..1
             float ms = 40.0f + vsize * (1000.0f - 40.0f);
-            
             uint32_t lengthSamples = (uint32_t)(ms * (pod.AudioSampleRate() / 1000.0f));
             if(lengthSamples < 2) lengthSamples = 2;
 
-            // pos: knob2 -> relative offset in current buffer window
+            // pos: knob2 -> relative offset in current window, but computed against the last completed (inactive) buffer
             float vpos = pod.knob2.Value();
             uint32_t windowSamples = (uint32_t)((float)currentBufferLengthMs * (pod.AudioSampleRate() / 1000.0f));
             if(windowSamples < 2) windowSamples = 2;
             uint32_t offset = (uint32_t)(vpos * (float)windowSamples);
-            int64_t start = (int64_t)writeHead - (int64_t)offset;
-            while(start < 0) start += BUFFER_SIZE;
-            uint32_t startIdx = (uint32_t)start % BUFFER_SIZE;
 
+            uint32_t startIdx = 0;
+            if(inactiveBufferReady)
+            {
+                // map offset so knob=0 -> 'most recent sample in snapshot'
+                // most recent sample index in snapshot is inactiveTailIndex (BUFFER_SIZE-1 normally)
+                // start = (inactiveTailIndex + 1 + offset) % BUFFER_SIZE  (this maps similar to previous mapping but based on snapshot)
+                uint32_t base = (inactiveTailIndex + 1) % BUFFER_SIZE;
+                startIdx = (base + offset) % BUFFER_SIZE;
+            }
+            else
+            {
+                // fallback to current writeHead if no snapshot yet (early boot)
+                uint32_t offset2 = (uint32_t)(vpos * (float)BUFFER_SIZE);
+                uint32_t s = writeHead + offset2;
+                if(s >= BUFFER_SIZE) s %= BUFFER_SIZE;
+                startIdx = s;
+            }
 
             float pitchRatio = powf(2.0f, (float)enc_acc / 12.0f);
 
@@ -363,13 +391,13 @@ else
 
             pod.seed.PrintLine("Grain: start=%u len=%u semis=%d", startIdx, lengthSamples, enc_acc);
         }
-        // === ENCODER HANDLING: adjust pitch semitones ===
+
+        // === ENCODER HANDLING: adjust pitch semitones (only when not editing filter) ===
         if(!editEffectsMode)
         {
             int32_t inc = pod.encoder.Increment();
             if(inc != 0) {
                 enc_acc += inc;
-                // Clamp to reasonable range
                 if(enc_acc > 24) enc_acc = 24;
                 if(enc_acc < -24) enc_acc = -24;
                 pod.seed.PrintLine("Pitch: %d semitones", enc_acc);
@@ -379,18 +407,15 @@ else
         // === Effect Edit mapping (filter) ===
         float target_filt = filtCut_sm;
         if(editEffectsMode)
-{
-     // knob1 drives filter cutoff in Effect Edit
-        target_filt = pod.knob1.Value();
-}
+        {
+            target_filt = pod.knob1.Value();
+        }
 
-        // smooth the knob and publish to audio thread
+        // smooth and publish to audio thread
         filtCut_sm += (target_filt - filtCut_sm) * SMOOTH_ALPHA;
         filtCut_shared = filtCut_sm;   // publish safely
 
-
-
-        // === LED feedback (mutually exclusive colors) ===
+        // === LED feedback ===
         if(g_level_edit)
             pod.led1.Set(0.0f, 0.0f, 1.0f); // blue
         else if(editEffectsMode)
@@ -399,42 +424,31 @@ else
             pod.led1.Set(1.0f, 0.0f, 0.0f); // red
         pod.UpdateLeds();
 
-        // periodic profiler print (integer-safe)
-        // ---- profiler print (CPU usage) ----
-uint32_t t = System::GetNow();
-if(t - lastTick >= 1000)
-{
-    lastTick = t;
+        // periodic profiler print
+        uint32_t t = System::GetNow();
+        if(t - lastTick >= 1000)
+        {
+            lastTick = t;
+            uint32_t maxc  = audio_max_cycles;
+            uint32_t lastc = audio_last_cycles;
+            uint32_t block = pod.AudioBlockSize();
+            uint64_t cps_x100 = (uint64_t)maxc * 100ULL / (uint64_t)block;
+            const uint64_t CPU_FREQ = 480000000ULL;
+            uint64_t cpu_pct_x100 = ((uint64_t)maxc * (uint64_t)pod.AudioSampleRate() * 10000ULL)
+                                    / ((uint64_t)block * CPU_FREQ);
+            uint64_t cpu_int = cpu_pct_x100 / 100ULL;
+            uint64_t cpu_frac = cpu_pct_x100 % 100ULL;
 
-    uint32_t maxc  = audio_max_cycles;
-    uint32_t lastc = audio_last_cycles;
-    uint32_t block = pod.AudioBlockSize();
-
-    // cycles-per-sample ×100
-    uint32_t cps_x100 = (maxc * 100U) / block;
-
-    // CPU percent ×100
-    const uint64_t CPU_FREQ = 480000000ULL; // Hz
-    uint64_t cpu_pct_x100 =
-        ((uint64_t)maxc * (uint64_t)pod.AudioSampleRate() * 10000ULL) /
-        ((uint64_t)block * CPU_FREQ);
-
-    uint32_t cpu_int  = (uint32_t)(cpu_pct_x100 / 100ULL);
-    uint32_t cpu_frac = (uint32_t)(cpu_pct_x100 % 100ULL);
-
-    pod.seed.PrintLine(
-        "Audio cycles last=%lu max=%lu block=%lu cps_x100=%lu cpu=%lu.%02lu%%",
-        (unsigned long)lastc,
-        (unsigned long)maxc,
-        (unsigned long)block,
-        (unsigned long)cps_x100,
-        (unsigned long)cpu_int,
-        (unsigned long)cpu_frac);
-
-    audio_max_cycles = 0;
-    audio_min_cycles = UINT32_MAX;
-}
-
+            pod.seed.PrintLine( "Audio cycles last=%lu max=%lu block=%lu cps_x100=%lu cpu=%lu.%02lu%%", 
+            (unsigned long)lastc,
+            (unsigned long)maxc, 
+            (unsigned long)block, 
+            (unsigned long)cps_x100, 
+            (unsigned long)cpu_int, 
+            (unsigned long)cpu_frac); 
+            audio_max_cycles = 0; 
+            audio_min_cycles = UINT32_MAX;
+         }
         System::Delay(1);
     }
 
