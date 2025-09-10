@@ -1,6 +1,6 @@
 #pragma once
 // FilterBank.h
-// Simple wrapper around DaisySP Svf for a band-pass with log frequency mapping.
+// Simple wrapper around DaisySP Svf for a low-pass filter with log frequency mapping.
 
 #include "daisysp.h"
 #include <cmath>
@@ -13,7 +13,7 @@ class FilterBank
     void Init(float sampleRate)
     {
         filt_.Init(sampleRate);
-        filt_.SetRes(0.05f); // Very low for pure rolloff, no peak
+        filt_.SetRes(0.0f); // Very low for pure rolloff, no peak
         freq_ = 1000.0f;
     }
 
@@ -29,17 +29,24 @@ class FilterBank
         filt_.SetFreq(freq_);
     }
 
-    // set resonance (Q style). 0.1..2 reasonable
-    void SetRes(float r) { filt_.SetRes(r); }
+    // set resonance (Q style). Keep low for smooth rolloff
+    void SetRes(float r) { 
+        if(r < 0.0f) r = 0.0f;
+        if(r > 0.3f) r = 0.3f;  // Cap at low value to prevent peaks
+        filt_.SetRes(r); 
+    }
 
-    // process single sample (call Process before reading Band())
+    // process single sample (call Process before reading Low())
     void Process(float in)
     {
         filt_.Process(in);
     }
 
-    // return band-pass output
-    float Band() { return filt_.Band(); }
+    // return low-pass output
+    float Low() { return filt_.Low(); }
+
+    // For compatibility, redirect Band() calls to Low()
+    float Band() { return filt_.Low(); }
 
     float GetFreq() const { return freq_; }
 
